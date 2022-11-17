@@ -1,11 +1,25 @@
-use egg::{AstDepth, AstSize, CostFunction, Extractor, Pattern, Rewrite, Runner, SymbolLang};
+use egg::{
+    Applier, AstDepth, AstSize, CostFunction, Extractor, Id, Pattern, Rewrite, Runner, Searcher,
+    SymbolLang,
+};
+use pyo3::types::IntoPyDict;
 use pyo3::{exceptions::PyValueError, prelude::*};
+
+use std::sync::Arc;
 
 #[pyclass]
 struct Language(Vec<Rewrite<SymbolLang, ()>>);
 #[pyclass]
 #[derive(Clone)]
 struct RewriteRule(Vec<Rewrite<SymbolLang, ()>>);
+
+#[derive(Clone)]
+struct PyConditionalApplier {
+    condition: PyObject,
+    searcher: Arc<dyn Searcher<SymbolLang, ()> + Sync + Send>,
+    applier: Arc<dyn Applier<SymbolLang, ()> + Sync + Send>,
+}
+struct ProxySearcher(Arc<dyn Searcher<SymbolLang, ()> + Sync + Send>);
 
 impl Language {
     fn simplify_with_cost<C: CostFunction<SymbolLang>>(
@@ -79,6 +93,113 @@ impl RewriteRule {
             );
             Ok(RewriteRule(rules))
         })
+    }
+    fn only_when(&self, condition: Py<PyAny>) -> PyResult<Self> {
+        Python::with_gil(|py| {
+            Ok(RewriteRule(
+                self.0
+                    .iter()
+                    .map(|rule| {
+                        Rewrite::new(
+                            format!("{}-cond", &rule.name),
+                            ProxySearcher(rule.searcher.clone()),
+                            PyConditionalApplier {
+                                applier: rule.applier.clone(),
+                                condition: condition.clone(),
+                                searcher: rule.searcher.clone(),
+                            },
+                        )
+                        .map_err(|e| {
+                            PyErr::from_value(PyValueError::new_err(e.to_string()).value(py))
+                        })
+                    })
+                    .collect::<PyResult<Vec<_>>>()?,
+            ))
+        })
+    }
+}
+
+impl Applier<SymbolLang, ()> for PyConditionalApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut egg::EGraph<SymbolLang, ()>,
+        eclass: egg::Id,
+        subst: &egg::Subst,
+        searcher_ast: Option<&egg::PatternAst<SymbolLang>>,
+        rule_name: egg::Symbol,
+    ) -> Vec<egg::Id> {
+        let result = Python::with_gil(|py| {
+            let args = self
+                .searcher
+                .vars()
+                .into_iter()
+                .flat_map(|var| {
+                    fn convert(
+                        id: Id,
+                        egraph: &egg::EGraph<SymbolLang, ()>,
+                        py: Python,
+                    ) -> PyObject {
+                        egraph[id]
+                            .nodes
+                            .iter()
+                            .map(|v| {
+                                use egg::Language;
+                                (
+                                    v.op.as_str(),
+                                    v.children()
+                                        .iter()
+                                        .map(|child| convert(*child, egraph, py))
+                                        .collect::<Vec<_>>(),
+                                )
+                                    .to_object(py)
+                            })
+                            .collect::<Vec<_>>()
+                            .to_object(py)
+                    }
+                    subst
+                        .get(var)
+                        .map(|value| {
+                            let mut name = var.to_string();
+                            // Strip leading question mark
+                            name.remove(0);
+
+                            (name, convert(*value, egraph, py))
+                        })
+                        .into_iter()
+                })
+                .into_py_dict(py);
+            match self
+                .condition
+                .call(py, (), Some(args))
+                .and_then(|r| r.is_true(py))
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    eprint!("Python error happen in egraph condition: {}", e);
+                    false
+                }
+            }
+        });
+        if result {
+            self.applier
+                .apply_one(egraph, eclass, subst, searcher_ast, rule_name)
+        } else {
+            vec![]
+        }
+    }
+}
+impl Searcher<SymbolLang, ()> for ProxySearcher {
+    fn search_eclass_with_limit(
+        &self,
+        egraph: &egg::EGraph<SymbolLang, ()>,
+        eclass: egg::Id,
+        limit: usize,
+    ) -> Option<egg::SearchMatches<SymbolLang>> {
+        self.0.search_eclass_with_limit(egraph, eclass, limit)
+    }
+
+    fn vars(&self) -> Vec<egg::Var> {
+        self.0.vars()
     }
 }
 
