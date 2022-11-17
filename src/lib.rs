@@ -36,7 +36,21 @@ impl Language {
                 let runner = Runner::default().with_expr(&expr).run(&self.0);
                 let extractor = Extractor::new(&runner.egraph, cost_function);
                 let (best_cost, best) = extractor.find_best(runner.roots[0]);
-                Ok((best_cost, best.to_string()).to_object(py))
+
+                let result = best.as_ref().last().unwrap();
+                Ok((best_cost, {
+                    use egg::Language;
+                    (
+                        result.op.as_str(),
+                        result
+                            .children()
+                            .iter()
+                            .map(|child| convert(*child, &runner.egraph, py))
+                            .collect::<Vec<_>>(),
+                    )
+                        .to_object(py)
+                })
+                    .to_object(py))
             }
             Err(e) => Err(PyErr::from_value(
                 PyValueError::new_err(e.to_string()).value(py),
@@ -134,28 +148,6 @@ impl Applier<SymbolLang, ()> for PyConditionalApplier {
                 .vars()
                 .into_iter()
                 .flat_map(|var| {
-                    fn convert(
-                        id: Id,
-                        egraph: &egg::EGraph<SymbolLang, ()>,
-                        py: Python,
-                    ) -> PyObject {
-                        egraph[id]
-                            .nodes
-                            .iter()
-                            .map(|v| {
-                                use egg::Language;
-                                (
-                                    v.op.as_str(),
-                                    v.children()
-                                        .iter()
-                                        .map(|child| convert(*child, egraph, py))
-                                        .collect::<Vec<_>>(),
-                                )
-                                    .to_object(py)
-                            })
-                            .collect::<Vec<_>>()
-                            .to_object(py)
-                    }
                     subst
                         .get(var)
                         .map(|value| {
@@ -201,6 +193,24 @@ impl Searcher<SymbolLang, ()> for ProxySearcher {
     fn vars(&self) -> Vec<egg::Var> {
         self.0.vars()
     }
+}
+fn convert(id: Id, egraph: &egg::EGraph<SymbolLang, ()>, py: Python) -> PyObject {
+    egraph[id]
+        .nodes
+        .iter()
+        .map(|v| {
+            use egg::Language;
+            (
+                v.op.as_str(),
+                v.children()
+                    .iter()
+                    .map(|child| convert(*child, egraph, py))
+                    .collect::<Vec<_>>(),
+            )
+                .to_object(py)
+        })
+        .next()
+        .to_object(py)
 }
 
 #[pymodule]
