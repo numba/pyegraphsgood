@@ -1,6 +1,6 @@
 use egg::{
-    Applier, AstDepth, AstSize, CostFunction, Extractor, Id, Pattern, Rewrite, Runner, Searcher,
-    SymbolLang,
+    Applier, AstDepth, AstSize, CostFunction, Extractor, FromOp, Id, Pattern, RecExpr, Rewrite,
+    Runner, Searcher, SymbolLang,
 };
 use pyo3::types::IntoPyDict;
 use pyo3::{exceptions::PyValueError, prelude::*};
@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 #[pyclass]
 struct Language(Vec<Rewrite<SymbolLang, ()>>);
+struct Input(RecExpr<SymbolLang>);
 #[pyclass]
 #[derive(Clone)]
 struct RewriteRule(Vec<Rewrite<SymbolLang, ()>>);
@@ -24,38 +25,31 @@ struct ProxySearcher(Arc<dyn Searcher<SymbolLang, ()> + Sync + Send>);
 impl Language {
     fn simplify_with_cost<C: CostFunction<SymbolLang>>(
         &self,
-        input: &str,
+        input: Input,
         cost_function: C,
         py: Python,
     ) -> PyResult<PyObject>
     where
         C::Cost: ToPyObject,
     {
-        match input.parse() {
-            Ok(expr) => {
-                let runner = Runner::default().with_expr(&expr).run(&self.0);
-                let extractor = Extractor::new(&runner.egraph, cost_function);
-                let (best_cost, best) = extractor.find_best(runner.roots[0]);
+        let runner = Runner::default().with_expr(&input.0).run(&self.0);
+        let extractor = Extractor::new(&runner.egraph, cost_function);
+        let (best_cost, best) = extractor.find_best(runner.roots[0]);
 
-                let result = best.as_ref().last().unwrap();
-                Ok((best_cost, {
-                    use egg::Language;
-                    (
-                        result.op.as_str(),
-                        result
-                            .children()
-                            .iter()
-                            .map(|child| convert(*child, &runner.egraph, py))
-                            .collect::<Vec<_>>(),
-                    )
-                        .to_object(py)
-                })
-                    .to_object(py))
-            }
-            Err(e) => Err(PyErr::from_value(
-                PyValueError::new_err(e.to_string()).value(py),
-            )),
-        }
+        let result = best.as_ref().last().unwrap();
+        Ok((best_cost, {
+            use egg::Language;
+            (
+                result.op.as_str(),
+                result
+                    .children()
+                    .iter()
+                    .map(|child| convert(*child, &runner.egraph, py))
+                    .collect::<Vec<_>>(),
+            )
+                .to_object(py)
+        })
+            .to_object(py))
     }
 }
 
@@ -70,7 +64,7 @@ impl Language {
                 .collect(),
         )
     }
-    fn simplify(&self, input: &str, cost: &str) -> PyResult<PyObject> {
+    fn simplify(&self, input: Input, cost: &str) -> PyResult<PyObject> {
         Python::with_gil(|py| match cost {
             "ast-size" => self.simplify_with_cost(input, AstSize, py),
             "ast-depth" => self.simplify_with_cost(input, AstDepth, py),
@@ -192,6 +186,44 @@ impl Searcher<SymbolLang, ()> for ProxySearcher {
 
     fn vars(&self) -> Vec<egg::Var> {
         self.0.vars()
+    }
+}
+
+impl<'source> FromPyObject<'source> for Input {
+    fn extract(ob: &'source PyAny) -> PyResult<Self> {
+        Python::with_gil(|py| match ob.extract::<(&str, Vec<PyObject>)>() {
+            Ok((name, children)) => {
+                fn unpack(
+                    expr: &mut RecExpr<SymbolLang>,
+                    value: PyObject,
+                    py: Python,
+                ) -> PyResult<Id> {
+                    let (name, children) = value.extract::<(&str, Vec<PyObject>)>(py)?;
+                    let children = children
+                        .into_iter()
+                        .map(|child| unpack(expr, child, py))
+                        .collect::<PyResult<Vec<_>>>()?;
+                    Ok(expr.add(SymbolLang::from_op(name, children).map_err(|e| {
+                        PyErr::from_value(PyValueError::new_err(e.to_string()).value(py))
+                    })?))
+                }
+                let mut expr = RecExpr::default();
+                let children = children
+                    .into_iter()
+                    .map(|child| unpack(&mut expr, child, py))
+                    .collect::<PyResult<Vec<_>>>()?;
+                expr.add(SymbolLang::from_op(name, children).map_err(|e| {
+                    PyErr::from_value(PyValueError::new_err(e.to_string()).value(py))
+                })?);
+                Ok(Input(expr))
+            }
+            Err(_) => match ob.extract::<&str>()?.parse() {
+                Ok(expr) => Ok(Input(expr)),
+                Err(e) => Err(PyErr::from_value(
+                    PyValueError::new_err(e.to_string()).value(py),
+                )),
+            },
+        })
     }
 }
 fn convert(id: Id, egraph: &egg::EGraph<SymbolLang, ()>, py: Python) -> PyObject {
