@@ -27,3 +27,7 @@ print(
     lang.simplify(
         ("/", [("*", [("2", []), ("a", [])]), ("2", [])]),
         "ast-size"))
+print(
+    lang.simplify(
+        ("/", ("*", ("2", ), ("a", )), ("2", )),
+        "ast-size"))

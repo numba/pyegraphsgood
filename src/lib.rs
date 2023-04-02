@@ -2,7 +2,7 @@ use egg::{
     Applier, AstDepth, AstSize, CostFunction, Extractor, FromOp, Id, Pattern, RecExpr, Rewrite,
     Runner, Searcher, SymbolLang,
 };
-use pyo3::types::IntoPyDict;
+use pyo3::types::{IntoPyDict, PyTuple};
 use pyo3::{exceptions::PyValueError, prelude::*};
 
 use std::sync::Arc;
@@ -195,33 +195,57 @@ impl<'source> FromPyObject<'source> for Input {
             Ok((name, children)) => {
                 fn unpack(
                     expr: &mut RecExpr<SymbolLang>,
-                    value: PyObject,
+                    name: &str,
+                    children: Vec<PyObject>,
                     py: Python,
                 ) -> PyResult<Id> {
-                    let (name, children) = value.extract::<(&str, Vec<PyObject>)>(py)?;
                     let children = children
                         .into_iter()
-                        .map(|child| unpack(expr, child, py))
+                        .map(|child| {
+                            let (name, children) = child.extract::<(&str, Vec<PyObject>)>(py)?;
+                            unpack(expr, name, children, py)
+                        })
                         .collect::<PyResult<Vec<_>>>()?;
                     Ok(expr.add(SymbolLang::from_op(name, children).map_err(|e| {
                         PyErr::from_value(PyValueError::new_err(e.to_string()).value(py))
                     })?))
                 }
                 let mut expr = RecExpr::default();
-                let children = children
-                    .into_iter()
-                    .map(|child| unpack(&mut expr, child, py))
-                    .collect::<PyResult<Vec<_>>>()?;
-                expr.add(SymbolLang::from_op(name, children).map_err(|e| {
-                    PyErr::from_value(PyValueError::new_err(e.to_string()).value(py))
-                })?);
+                unpack(&mut expr, name, children, py)?;
                 Ok(Input(expr))
             }
-            Err(_) => match ob.extract::<&str>()?.parse() {
-                Ok(expr) => Ok(Input(expr)),
-                Err(e) => Err(PyErr::from_value(
-                    PyValueError::new_err(e.to_string()).value(py),
-                )),
+            Err(_) => match ob.extract::<&PyTuple>() {
+                Ok(tuple) => {
+                    fn unpack(
+                        expr: &mut RecExpr<SymbolLang>,
+                        value: &PyTuple,
+                        py: Python,
+                    ) -> PyResult<Id> {
+                        if value.len() == 0 {
+                            return Err(PyErr::from_value(
+                                PyValueError::new_err("Cannot handle empty tuple.").value(py),
+                            ));
+                        }
+                        let name = value.get_item(0)?.extract()?;
+                        let children = value
+                            .iter()
+                            .skip(1)
+                            .map(|item| unpack(expr, item.extract()?, py))
+                            .collect::<Result<_, _>>()?;
+                        Ok(expr.add(SymbolLang::from_op(name, children).map_err(|e| {
+                            PyErr::from_value(PyValueError::new_err(e.to_string()).value(py))
+                        })?))
+                    }
+                    let mut expr = RecExpr::default();
+                    unpack(&mut expr, tuple, py)?;
+                    Ok(Input(expr))
+                }
+                Err(_) => match ob.extract::<&str>()?.parse() {
+                    Ok(expr) => Ok(Input(expr)),
+                    Err(e) => Err(PyErr::from_value(
+                        PyValueError::new_err(e.to_string()).value(py),
+                    )),
+                },
             },
         })
     }
